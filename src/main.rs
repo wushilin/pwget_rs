@@ -460,6 +460,8 @@ async fn main() -> Result<()> {
     // Shared HTTP client.
     let client = reqwest::Client::builder()
         .user_agent("pwget/0.1")
+        // Make connection setup (DNS/TCP/TLS) fail fast per thread timeout.
+        .connect_timeout(Duration::from_secs(cli.thread_timeout_secs.max(1)))
         .pool_max_idle_per_host(cli.hard_limit.max(1) * cli.parallel.max(1))
         .build()
         .context("failed to build HTTP client")?;
@@ -1716,7 +1718,26 @@ async fn worker_loop(
                 break;
             }
             let range_header = format!("bytes={}-", pos);
-            let resp = client.get(&url).header(RANGE, range_header).send().await;
+            // Apply per-thread timeout to connection setup / request send as well (DNS/connect/TLS/headers).
+            let resp = tokio::time::timeout(
+                per_read_timeout,
+                client.get(&url).header(RANGE, range_header).send(),
+            )
+            .await;
+            let resp = match resp {
+                Ok(r) => r,
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    *last_error.lock().await = format!(
+                        "thread timeout: request setup/send exceeded {:.0}s",
+                        per_read_timeout.as_secs_f64()
+                    );
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    continue 'conn;
+                }
+            };
             let resp = match resp {
                 Ok(rsp) => rsp,
                 Err(e) => {

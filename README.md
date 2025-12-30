@@ -1,4 +1,7 @@
 # pwget
+Fancy, parallel downloader in terinal, written in Rust. You can visualize download progress, dynamically increase parallelism.
+
+<img width="1728" height="953" alt="image" src="https://github.com/user-attachments/assets/3e758c1f-15a2-409a-9e4f-cd8dbfc2caf1" />
 
 `pwget` is a parallel `wget`-like downloader written in Rust. Its differentiator is a **terminal grid UI** where each cell represents a chunk (“block”) of the file and changes color as it downloads.
 

@@ -1,0 +1,22 @@
+[package]
+name = "pwget_rs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pwget"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.23", features = ["derive"] }
+crossterm = "0.28.1"
+futures-util = "0.3.31"
+ratatui = "0.29.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "system-proxy"] }
+serde = { version = "1.0.214", features = ["derive"] }
+serde_json = "1.0.132"
+tokio = { version = "1.41.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util = "0.7.12"
+url = "2.5.4"
+percent-encoding = "2.3.2"

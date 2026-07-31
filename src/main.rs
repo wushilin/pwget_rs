@@ -5,103 +5,60 @@ use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use crossterm::{
     cursor,
-    execute,
     event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use percent_encoding::percent_decode_str;
 use futures_util::StreamExt;
+use percent_encoding::percent_decode_str;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Terminal,
 };
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch, Mutex};
+use reqwest::header::{
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, LAST_MODIFIED, RANGE,
+};
+use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-#[derive(Debug, Parser, Clone)]
-#[command(name = "pwget", version, about = "Parallel wget-like downloader with a grid TUI")]
-struct Cli {
-    /// URL to download (single-file mode). Omit when using -T.
-    #[arg(required_unless_present = "url_list")]
-    url: Option<String>,
+mod cli;
+mod meta;
 
-    /// Number of download threads
-    #[arg(short = 'n', long = "threads", default_value_t = 5)]
-    threads: usize,
+use crate::cli::{Cli, ListFormat, parse_extra_headers};
+use crate::meta::{MetaV2, load_meta_if_present, write_meta_atomic};
 
-    /// Hard limit for maximum workers (spawned + enabled via hotkeys)
-    #[arg(short = 'N', long = "hard-limit", default_value_t = 20)]
-    hard_limit: usize,
-
-    /// Assume "yes" for prompts (overwrite file, etc.)
-    #[arg(long = "yes")]
-    yes: bool,
-
-    /// Global timeout: if no bytes are written for this many seconds, abort
-    #[arg(long = "timeout", default_value_t = 60)]
-    timeout_secs: u64,
-
-    /// Per-thread timeout: if a range request doesn't complete within this many seconds, retry
-    #[arg(long = "ttimeout", default_value_t = 10)]
-    thread_timeout_secs: u64,
-
-    /// Per-thread backoff: sleep this many seconds between retries
-    #[arg(long = "tbackoff", default_value_t = 3)]
-    thread_backoff_secs: u64,
-
-    /// Output file path (defaults to last URL path segment)
-    #[arg(short = 'o', long = "output", conflicts_with = "download_dir", conflicts_with = "url_list")]
-    output: Option<PathBuf>,
-
-    /// Download directory (used when output name is derived). Not allowed with -o.
-    #[arg(short = 'd', long = "dir", conflicts_with = "output")]
-    download_dir: Option<PathBuf>,
-
-    /// File containing URLs (one per line). Requires -d. Forces --noui.
-    #[arg(short = 'T', long = "urllist", requires = "download_dir")]
-    url_list: Option<PathBuf>,
-
-    /// Format of the -T/--urllist file
-    #[arg(long = "list-format", value_enum, default_value_t = ListFormat::Plain)]
-    list_format: ListFormat,
-
-    /// Number of downloads to run in parallel in -T batch mode (each download uses its own -n/-N worker pool)
-    #[arg(short = 'p', long = "parallel", default_value_t = 3)]
-    parallel: usize,
-
-    /// Metadata path for resume support (defaults to OUTPUT + ".meta")
-    #[arg(long = "meta")]
-    meta: Option<PathBuf>,
-
-    /// Disable the TUI and use simple line-based progress output
-    #[arg(long = "noui")]
-    noui: bool,
-}
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy)]
-enum ListFormat {
-    Plain,
-    Csv,
-    Json,
+fn debug_println(enabled: bool, msg: impl AsRef<str>) {
+    if !enabled {
+        return;
+    }
+    let msg = msg.as_ref();
+    let mut stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let _ = write!(stderr, "\r\x1b[2K[debug] {msg}\r\n");
+        let _ = stderr.flush();
+    } else {
+        eprintln!("[debug] {msg}");
+    }
 }
 
 const MIN_TICK: Duration = Duration::from_millis(33);
@@ -113,7 +70,8 @@ async fn shutdown_signal() -> Result<()> {
 
     #[cfg(unix)]
     {
-        let mut term = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+        let mut term =
+            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
         let mut hup = signal(SignalKind::hangup()).context("failed to install SIGHUP handler")?;
         tokio::select! {
             _ = &mut ctrl_c => {},
@@ -132,9 +90,26 @@ async fn shutdown_signal() -> Result<()> {
 
 #[derive(Debug, Clone)]
 struct ProbeInfo {
-    len: u64,
+    len: Option<u64>,
     ranges_ok: bool,
     content_disposition: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamFallbackReason {
+    UnknownLength,
+    RangesUnavailable,
+}
+
+impl StreamFallbackReason {
+    fn label(self) -> &'static str {
+        match self {
+            StreamFallbackReason::UnknownLength => "unknown content length",
+            StreamFallbackReason::RangesUnavailable => "byte ranges unavailable",
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -176,7 +151,10 @@ fn resolve_save_as(download_dir: &Path, save_as: &str) -> Result<PathBuf> {
         bail!("save_as is empty");
     }
     if p.is_absolute() {
-        bail!("save_as must be relative, got absolute path: {}", p.display());
+        bail!(
+            "save_as must be relative, got absolute path: {}",
+            p.display()
+        );
     }
     for comp in p.components() {
         match comp {
@@ -267,14 +245,14 @@ fn parse_urllist(text: &str, fmt: ListFormat) -> Result<Vec<BatchItem>> {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let (save_as, rest) =
-                    parse_field(line).with_context(|| format!("csv line {}: failed parsing save_as", idx + 1))?;
+                let (save_as, rest) = parse_field(line)
+                    .with_context(|| format!("csv line {}: failed parsing save_as", idx + 1))?;
                 let rest = rest.trim_start();
                 let rest = rest
                     .strip_prefix(',')
                     .ok_or_else(|| anyhow!("csv line {}: expected ',' separator", idx + 1))?;
-                let (url, _rest2) =
-                    parse_field(rest).with_context(|| format!("csv line {}: failed parsing url", idx + 1))?;
+                let (url, _rest2) = parse_field(rest)
+                    .with_context(|| format!("csv line {}: failed parsing url", idx + 1))?;
                 if url.trim().is_empty() {
                     bail!("csv line {}: url is empty", idx + 1);
                 }
@@ -392,21 +370,6 @@ enum Event {
     Error(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MetaV2 {
-    version: u32,
-    output: String,
-    total_len: u64,
-    blocks_used: usize,
-    done: Vec<bool>,
-}
-
-impl MetaV2 {
-    fn meta_path_for_output(output: &Path) -> PathBuf {
-        PathBuf::from(format!("{}.meta", output.display()))
-    }
-}
-
 #[derive(Debug)]
 enum SchedToWorker {
     Assign(Vec<usize>),
@@ -416,8 +379,13 @@ enum SchedToWorker {
 
 #[derive(Debug)]
 enum WorkerToSched {
-    NeedWork { worker: usize },
-    Status { worker: usize, remaining_blocks: usize },
+    NeedWork {
+        worker: usize,
+    },
+    Status {
+        worker: usize,
+        remaining_blocks: usize,
+    },
     StealReply {
         victim: usize,
         requester: usize,
@@ -457,14 +425,38 @@ async fn main() -> Result<()> {
         );
     }
 
+    let (ua, mut extra_headers) = parse_extra_headers(&cli)?;
+    extra_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    if cli.debug {
+        debug_println(true, "debug enabled: forcing --noui (disables TUI)");
+        debug_println(
+            true,
+            format!(
+                "http config: ua={:?}  extra_headers=[{}]",
+                ua.as_deref().unwrap_or("pwget/0.1"),
+                extra_headers
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = v.to_str().unwrap_or("<non-utf8>");
+                        format!("{k}={val}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
     // Shared HTTP client.
-    let client = reqwest::Client::builder()
-        .user_agent("pwget/0.1")
+    let mut builder = reqwest::Client::builder()
+        .default_headers(extra_headers)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
         // Make connection setup (DNS/TCP/TLS) fail fast per thread timeout.
         .connect_timeout(Duration::from_secs(cli.thread_timeout_secs.max(1)))
-        .pool_max_idle_per_host(cli.hard_limit.max(1) * cli.parallel.max(1))
-        .build()
-        .context("failed to build HTTP client")?;
+        .pool_max_idle_per_host(cli.hard_limit.max(1) * cli.parallel.max(1));
+    builder = builder.user_agent(ua.unwrap_or_else(|| "pwget/0.1".to_string()));
+    let client = builder.build().context("failed to build HTTP client")?;
 
     // Batch mode (-T): force --noui and require -d.
     if let Some(list_path) = cli.url_list.as_ref() {
@@ -483,8 +475,13 @@ async fn main() -> Result<()> {
         let text = tokio::fs::read_to_string(list_path)
             .await
             .with_context(|| format!("failed to read urllist {}", list_path.display()))?;
-        let items = parse_urllist(&text, cli.list_format)
-            .with_context(|| format!("failed parsing urllist {} as {:?}", list_path.display(), cli.list_format))?;
+        let items = parse_urllist(&text, cli.list_format).with_context(|| {
+            format!(
+                "failed parsing urllist {} as {:?}",
+                list_path.display(),
+                cli.list_format
+            )
+        })?;
         if items.is_empty() {
             bail!("urllist is empty: {}", list_path.display());
         }
@@ -701,12 +698,16 @@ async fn run_one_download(
     let grid_cols_live = usable_cols as usize;
     let cell_capacity_live = grid_rows_live * grid_cols_live;
 
-    let probe = probe_len_and_ranges(&client, &url).await?;
-    let len = probe.len;
+    let probe = probe_len_and_ranges(&client, &url, cli.debug).await?;
     let ranges_ok = probe.ranges_ok;
-    if len == 0 {
-        bail!("remote content-length is 0 (nothing to download)");
-    }
+
+    debug_println(
+        cli.debug,
+        format!(
+            "probe result: len={:?} ranges_ok={ranges_ok} content_disposition={:?}",
+            probe.len, probe.content_disposition
+        ),
+    );
 
     let output_user_specified = cli.output.is_some() || output_override.is_some();
     let output_path = if let Some(p) = output_override.clone() {
@@ -732,6 +733,44 @@ async fn run_one_download(
     } else {
         output_path
     };
+
+    let stream_reason = if probe.len.is_none() {
+        Some(StreamFallbackReason::UnknownLength)
+    } else if !ranges_ok {
+        Some(StreamFallbackReason::RangesUnavailable)
+    } else {
+        None
+    };
+
+    if let Some(stream_reason) = stream_reason {
+        if cli.meta.is_some() {
+            bail!("--meta requires a known Content-Length and byte range support");
+        }
+        debug_println(
+            cli.debug,
+            format!(
+                "falling back to sequential stream mode: {} (no resume/grid range download)",
+                stream_reason.label()
+            ),
+        );
+        return run_stream_download(
+            cli,
+            client,
+            url,
+            output_path,
+            probe.len,
+            stream_reason,
+            batch,
+            quiet_summary,
+        )
+        .await;
+    }
+
+    let len = probe.len.unwrap();
+    if len == 0 {
+        bail!("remote content-length is 0 (nothing to download)");
+    }
+
     let meta_path = cli
         .meta
         .clone()
@@ -745,7 +784,11 @@ async fn run_one_download(
             bail!("unsupported meta version: {}", m.version);
         }
         if m.total_len != len {
-            bail!("meta total size mismatch: meta has {}, but server reports {}", m.total_len, len);
+            bail!(
+                "meta total size mismatch: meta has {}, but server reports {}",
+                m.total_len,
+                len
+            );
         }
         if m.blocks_used == 0 {
             bail!("meta has invalid blocks_used=0");
@@ -757,10 +800,37 @@ async fn run_one_download(
                 m.blocks_used
             );
         }
+        if let Some(meta_url) = m.url.as_ref() {
+            if meta_url != &url {
+                bail!("meta URL mismatch: meta is for {meta_url}, current URL is {url}");
+            }
+        }
+        if let Some(meta_etag) = m.etag.as_ref() {
+            if probe.etag.as_ref() != Some(meta_etag) {
+                bail!(
+                    "meta ETag mismatch: meta has {:?}, server reports {:?}",
+                    meta_etag,
+                    probe.etag
+                );
+            }
+        }
+        if let Some(meta_last_modified) = m.last_modified.as_ref() {
+            if probe.last_modified.as_ref() != Some(meta_last_modified) {
+                bail!(
+                    "meta Last-Modified mismatch: meta has {:?}, server reports {:?}",
+                    meta_last_modified,
+                    probe.last_modified
+                );
+            }
+        }
 
         // If the terminal size differs from the original `blocks_used`, we can still render:
         // we linearly scale real blocks into the available visual cells.
-        if std::io::stdout().is_terminal() && !cli.noui && !force_noui && cell_capacity_live != m.blocks_used {
+        if std::io::stdout().is_terminal()
+            && !cli.noui
+            && !force_noui
+            && cell_capacity_live != m.blocks_used
+        {
             eprintln!(
                 "note: resume metadata has blocks_used={}, but current terminal has {} usable cells (excluding last row/col).",
                 m.blocks_used, cell_capacity_live
@@ -770,72 +840,79 @@ async fn run_one_download(
     }
 
     // Compute layout (new run vs resume)
-    let (_grid_rows, _grid_cols, cell_count, bytes_per_cell, active_cells, _threads_to_use, done_bitmap) =
-        if let Some(m) = meta.as_ref() {
-            let bytes_per_cell = (len + (m.blocks_used as u64) - 1) / (m.blocks_used as u64);
-            if bytes_per_cell == 0 {
-                bail!("computed bytes_per_cell is 0 (unexpected)");
+    let (
+        _grid_rows,
+        _grid_cols,
+        cell_count,
+        bytes_per_cell,
+        active_cells,
+        _threads_to_use,
+        done_bitmap,
+    ) = if let Some(m) = meta.as_ref() {
+        let bytes_per_cell = (len + (m.blocks_used as u64) - 1) / (m.blocks_used as u64);
+        if bytes_per_cell == 0 {
+            bail!("computed bytes_per_cell is 0 (unexpected)");
+        }
+        let mut done = m.done.clone();
+        // Normalize blocks beyond EOF to done=true.
+        for idx in 0..done.len() {
+            let (start, _) = block_byte_range(idx, bytes_per_cell, len);
+            if start >= len {
+                done[idx] = true;
             }
-            let mut done = m.done.clone();
-            // Normalize blocks beyond EOF to done=true.
-            for idx in 0..done.len() {
-                let (start, _) = block_byte_range(idx, bytes_per_cell, len);
-                if start >= len {
-                    done[idx] = true;
+        }
+        let active_cells = done
+            .iter()
+            .enumerate()
+            .take(m.blocks_used)
+            .take_while(|(idx, _)| {
+                let (start, _) = block_byte_range(*idx, bytes_per_cell, len);
+                start < len
+            })
+            .count();
+        (
+            grid_rows_live,
+            grid_cols_live,
+            m.blocks_used,
+            bytes_per_cell,
+            active_cells,
+            cli.threads.max(1),
+            done,
+        )
+    } else {
+        let cell_count = cell_capacity_live;
+        let bytes_per_cell = (len + (cell_count as u64) - 1) / (cell_count as u64); // ceil
+        if bytes_per_cell == 0 {
+            bail!("computed bytes_per_cell is 0 (unexpected)");
+        }
+        let mut active_cells: usize = 0;
+        for idx in 0..cell_count {
+            let start = (idx as u64) * bytes_per_cell;
+            if start >= len {
+                break;
+            }
+            active_cells += 1;
+        }
+        if active_cells == 0 {
+            bail!("no active cells were generated (unexpected)");
+        }
+        (
+            grid_rows_live,
+            grid_cols_live,
+            cell_count,
+            bytes_per_cell,
+            active_cells,
+            cli.threads.max(1),
+            {
+                // done bitmap spans all blocks used; blocks beyond EOF are marked done.
+                let mut d = vec![false; cell_count];
+                for idx in active_cells..cell_count {
+                    d[idx] = true;
                 }
-            }
-            let active_cells = done
-                .iter()
-                .enumerate()
-                .take(m.blocks_used)
-                .take_while(|(idx, _)| {
-                    let (start, _) = block_byte_range(*idx, bytes_per_cell, len);
-                    start < len
-                })
-                .count();
-            (
-                grid_rows_live,
-                grid_cols_live,
-                m.blocks_used,
-                bytes_per_cell,
-                active_cells,
-                cli.threads.max(1),
-                done,
-            )
-        } else {
-            let cell_count = cell_capacity_live;
-            let bytes_per_cell = (len + (cell_count as u64) - 1) / (cell_count as u64); // ceil
-            if bytes_per_cell == 0 {
-                bail!("computed bytes_per_cell is 0 (unexpected)");
-            }
-            let mut active_cells: usize = 0;
-            for idx in 0..cell_count {
-                let start = (idx as u64) * bytes_per_cell;
-                if start >= len {
-                    break;
-                }
-                active_cells += 1;
-            }
-            if active_cells == 0 {
-                bail!("no active cells were generated (unexpected)");
-            }
-            (
-                grid_rows_live,
-                grid_cols_live,
-                cell_count,
-                bytes_per_cell,
-                active_cells,
-                cli.threads.max(1),
-                {
-                    // done bitmap spans all blocks used; blocks beyond EOF are marked done.
-                    let mut d = vec![false; cell_count];
-                    for idx in active_cells..cell_count {
-                        d[idx] = true;
-                    }
-                    d
-                },
-            )
-        };
+                d
+            },
+        )
+    };
 
     // If output exists and we're NOT resuming, confirm overwrite.
     // In batch mode, avoid interactive prompts: require --yes or fail this URL.
@@ -872,11 +949,6 @@ async fn run_one_download(
         };
     }
 
-    // If server doesn't support range requests, we currently require it for parallel chunking.
-    if !ranges_ok {
-        bail!("server does not advertise byte range support (missing/invalid Accept-Ranges); can't do parallel cell downloads");
-    }
-
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<Event>();
     let cancel = CancellationToken::new();
 
@@ -887,11 +959,7 @@ async fn run_one_download(
         .filter(|(_, d)| **d)
         .map(|(idx, _)| {
             let (start, end) = block_byte_range(idx, bytes_per_cell, len);
-            if start >= len {
-                0
-            } else {
-                end - start + 1
-            }
+            if start >= len { 0 } else { end - start + 1 }
         })
         .sum::<u64>();
     let completed_bytes = Arc::new(AtomicU64::new(already_completed));
@@ -918,13 +986,15 @@ async fn run_one_download(
 
     // Cooperative scheduler channels
     let (to_sched_tx, mut to_sched_rx) = mpsc::unbounded_channel::<WorkerToSched>();
-    let mut to_workers: Vec<mpsc::UnboundedSender<SchedToWorker>> = Vec::with_capacity(worker_count);
+    let mut to_workers: Vec<mpsc::UnboundedSender<SchedToWorker>> =
+        Vec::with_capacity(worker_count);
 
     let mut handles = Vec::with_capacity(worker_count + 1);
 
     // Spawn workers
     let url0 = url.clone();
     let global_received0 = batch.as_ref().map(|b| b.global_received.clone());
+    let debug0 = cli.debug;
     for tid in 0..worker_count {
         let (to_worker_tx, to_worker_rx) = mpsc::unbounded_channel::<SchedToWorker>();
         to_workers.push(to_worker_tx);
@@ -940,6 +1010,7 @@ async fn run_one_download(
         let last_error = last_error.clone();
         let file = file.clone();
         let url = url0.clone();
+        let debug = debug0;
         let client = client.clone();
         let meta_dirty = meta_dirty.clone();
         let done = done.clone();
@@ -954,6 +1025,7 @@ async fn run_one_download(
                 len,
                 client,
                 url,
+                debug,
                 file,
                 done,
                 meta_dirty,
@@ -1007,7 +1079,7 @@ async fn run_one_download(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
-    let use_tui = std::io::stdout().is_terminal() && !cli.noui;
+    let use_tui = std::io::stdout().is_terminal() && !cli.noui && !cli.debug;
     let use_tui = use_tui && !force_noui;
     let mut meta_save_tick = tokio::time::interval(Duration::from_secs(5));
     let mut last_dirty_seen = meta_dirty.load(Ordering::Relaxed);
@@ -1018,6 +1090,9 @@ async fn run_one_download(
         meta = Some(MetaV2 {
             version: 2,
             output: output_path.display().to_string(),
+            url: Some(url.clone()),
+            etag: probe.etag.clone(),
+            last_modified: probe.last_modified.clone(),
             total_len: len,
             blocks_used: cell_count,
             done: done_bitmap.clone(),
@@ -1140,12 +1215,12 @@ async fn run_one_download(
             }
 
             if last_draw.elapsed() >= MIN_TICK {
-            let bytes = completed_bytes.load(Ordering::Relaxed).min(total_bytes);
+                let bytes = completed_bytes.load(Ordering::Relaxed).min(total_bytes);
                 let err_ct = errors.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
-            let rx = received_bytes.load(Ordering::Relaxed);
-            let speed_bps = (rx as f64) / elapsed;
-            let pct = (bytes as f64) * 100.0 / (total_bytes as f64);
+                let rx = received_bytes.load(Ordering::Relaxed);
+                let speed_bps = (rx as f64) / elapsed;
+                let pct = (bytes as f64) * 100.0 / (total_bytes as f64);
                 let enabled = enabled_count.min(worker_count as u64);
                 let active = active_conns.load(Ordering::Relaxed).min(enabled);
 
@@ -1291,7 +1366,11 @@ async fn run_one_download(
                 return Err(anyhow!(
                     "global timeout: no bytes written for {:.0}s (errors={err_ct}){}",
                     since_progress.as_secs_f64(),
-                    if last.is_empty() { "".to_string() } else { format!(", last_error={last}") }
+                    if last.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(", last_error={last}")
+                    }
                 ));
             }
 
@@ -1411,29 +1490,190 @@ async fn run_one_download(
     })
 }
 
-async fn load_meta_if_present(path: &Path) -> Result<Option<MetaV2>> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(s) => {
-            let m: MetaV2 = serde_json::from_str(&s)
-                .with_context(|| format!("failed parsing meta file {} (expected v2)", path.display()))?;
-            Ok(Some(m))
+async fn run_stream_download(
+    cli: &Cli,
+    client: reqwest::Client,
+    url: String,
+    output_path: PathBuf,
+    len_hint: Option<u64>,
+    reason: StreamFallbackReason,
+    batch: Option<BatchProgress>,
+    quiet_summary: bool,
+) -> Result<DownloadReport> {
+    if std::fs::metadata(&output_path).is_ok() {
+        if batch.is_some() && !cli.yes {
+            bail!(
+                "output exists: {} (rerun with --yes to overwrite in batch mode)",
+                output_path.display()
+            );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow!(e).context(format!("failed reading meta file {}", path.display()))),
+        confirm_overwrite(&output_path, cli.yes)?;
     }
-}
 
-async fn write_meta_atomic(path: &Path, meta: &MetaV2) -> Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    let data = serde_json::to_vec(meta).context("failed serializing meta")?;
-    tokio::fs::write(&tmp, data)
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create parent dir {}", parent.display()))?;
+        }
+    }
+
+    let resp = client
+        .get(&url)
+        .send()
         .await
-        .with_context(|| format!("failed writing tmp meta {}", tmp.display()))?;
-    // Best-effort atomic replace.
-    tokio::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to start stream download: {url}"))?;
+    if !resp.status().is_success() {
+        bail!("stream download failed: server returned {}", resp.status());
+    }
+    validate_identity_encoding(resp.headers())?;
+
+    let total_hint = len_hint.or_else(|| resp.content_length());
+    let part_path = PathBuf::from(format!("{}.part", output_path.display()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&part_path)
         .await
-        .with_context(|| format!("failed renaming meta {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+        .with_context(|| format!("failed to open temp output file: {}", part_path.display()))?;
+
+    let mut stream = resp.bytes_stream();
+    let start = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut last_draw = Instant::now() - Duration::from_millis(250);
+    let mut received = 0u64;
+    let mut read_timeouts = 0u64;
+    let global_timeout = Duration::from_secs(cli.timeout_secs.max(1));
+    let read_timeout = Duration::from_secs(cli.thread_timeout_secs.max(1));
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        let next = tokio::select! {
+            _ = &mut shutdown => {
+                bail!("cancelled");
+            }
+            next = tokio::time::timeout(read_timeout, stream.next()) => next,
+        };
+        let item = match next {
+            Ok(v) => v,
+            Err(_) => {
+                read_timeouts += 1;
+                let idle = last_progress.elapsed();
+                if batch.is_none() && last_draw.elapsed() >= Duration::from_millis(250) {
+                    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                    let speed = received as f64 / elapsed;
+                    let line = format_stream_status_line(
+                        received,
+                        total_hint,
+                        speed,
+                        idle,
+                        read_timeouts,
+                        reason,
+                    );
+                    let mut stderr = std::io::stderr();
+                    let _ = write!(stderr, "\r\x1b[2K{line}");
+                    let _ = stderr.flush();
+                    last_draw = Instant::now();
+                }
+                if idle > global_timeout {
+                    bail!(
+                        "stream timeout: no bytes received for {:.0}s ({}, read_timeouts={read_timeouts})",
+                        idle.as_secs_f64(),
+                        reason.label()
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(item) = item else {
+            break;
+        };
+        let bytes = item.context("stream download read error")?;
+        if bytes.is_empty() {
+            continue;
+        }
+        read_timeouts = 0;
+        file.write_all(&bytes)
+            .await
+            .context("failed writing stream download to output file")?;
+        received += bytes.len() as u64;
+        if let Some(b) = batch.as_ref() {
+            b.global_received
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        last_progress = Instant::now();
+
+        if batch.is_none() && last_draw.elapsed() >= Duration::from_millis(250) {
+            let elapsed = start.elapsed().as_secs_f64().max(0.001);
+            let speed = received as f64 / elapsed;
+            let line = format_stream_status_line(
+                received,
+                total_hint,
+                speed,
+                last_progress.elapsed(),
+                read_timeouts,
+                reason,
+            );
+            let mut stderr = std::io::stderr();
+            let _ = write!(stderr, "\r\x1b[2K{line}");
+            let _ = stderr.flush();
+            last_draw = Instant::now();
+        }
+    }
+    file.flush()
+        .await
+        .context("failed flushing stream download output file")?;
+    drop(file);
+
+    if let Some(total) = total_hint {
+        if received != total {
+            bail!(
+                "stream ended after {}, expected {}",
+                human_bytes(received as f64),
+                human_bytes(total as f64)
+            );
+        }
+    }
+
+    tokio::fs::rename(&part_path, &output_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed renaming temp output {} -> {}",
+                part_path.display(),
+                output_path.display()
+            )
+        })?;
+
+    if batch.is_none() {
+        eprintln!();
+    }
+
+    if !quiet_summary {
+        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+        let avg_bps = received as f64 / elapsed;
+        eprintln!(
+            "saved: {}\n  total_bytes: {}\n  session_downloaded: {}\n  time: {:.2}s\n  avg_speed: {}/s\n  mode: stream ({})",
+            output_path.display(),
+            total_hint
+                .map(|n| human_bytes(n as f64))
+                .unwrap_or_else(|| "unknown".to_string()),
+            human_bytes(received as f64),
+            elapsed,
+            human_bytes(avg_bps),
+            reason.label()
+        );
+    }
+
+    Ok(DownloadReport {
+        url,
+        output_path,
+        total_bytes: total_hint.unwrap_or(received),
+        session_downloaded: received,
+        elapsed: start.elapsed(),
+    })
 }
 
 fn block_byte_range(idx: usize, bytes_per_cell: u64, total_len: u64) -> (u64, u64) {
@@ -1470,7 +1710,9 @@ async fn scheduler_loop(
             _ = cancel.cancelled() => break,
             m = to_sched_rx.recv() => m,
         };
-        let Some(msg) = msg else { break; };
+        let Some(msg) = msg else {
+            break;
+        };
         match msg {
             WorkerToSched::NeedWork { worker } => {
                 if worker >= worker_count {
@@ -1499,17 +1741,25 @@ async fn scheduler_loop(
                 }
                 if let Some((victim, rem)) = best {
                     if rem >= 2 {
-                        let _ = to_workers[victim].send(SchedToWorker::StealRequest { requester: worker });
+                        let _ = to_workers[victim]
+                            .send(SchedToWorker::StealRequest { requester: worker });
                     }
                 }
             }
-            WorkerToSched::Status { worker, remaining_blocks } => {
+            WorkerToSched::Status {
+                worker,
+                remaining_blocks,
+            } => {
                 if worker >= worker_count {
                     continue;
                 }
                 remaining[worker] = remaining_blocks;
             }
-            WorkerToSched::StealReply { victim, requester, stolen } => {
+            WorkerToSched::StealReply {
+                victim,
+                requester,
+                stolen,
+            } => {
                 if victim >= worker_count || requester >= worker_count {
                     continue;
                 }
@@ -1540,6 +1790,7 @@ async fn worker_loop(
     total_len: u64,
     client: reqwest::Client,
     url: String,
+    debug: bool,
     file: Arc<std::fs::File>,
     done: Arc<Mutex<Vec<bool>>>,
     meta_dirty: Arc<AtomicU64>,
@@ -1718,6 +1969,13 @@ async fn worker_loop(
                 break;
             }
             let range_header = format!("bytes={}-", pos);
+            debug_println(
+                debug,
+                format!(
+                    "worker {tid}: connect pos={pos} range={range_header} current={current:?} qlen={}",
+                    queue.len()
+                ),
+            );
             // Apply per-thread timeout to connection setup / request send as well (DNS/connect/TLS/headers).
             let resp = tokio::time::timeout(
                 per_read_timeout,
@@ -1732,6 +1990,13 @@ async fn worker_loop(
                         "thread timeout: request setup/send exceeded {:.0}s",
                         per_read_timeout.as_secs_f64()
                     );
+                    debug_println(
+                        debug,
+                        format!(
+                            "worker {tid}: timeout during request setup/send (>{:.0}s), will retry",
+                            per_read_timeout.as_secs_f64()
+                        ),
+                    );
                     if !backoff.is_zero() {
                         tokio::time::sleep(backoff).await;
                     }
@@ -1743,18 +2008,47 @@ async fn worker_loop(
                 Err(e) => {
                     errors.fetch_add(1, Ordering::Relaxed);
                     *last_error.lock().await = format!("request error: {e}");
+                    debug_println(debug, format!("worker {tid}: request error: {e}"));
                     if !backoff.is_zero() {
                         tokio::time::sleep(backoff).await;
                     }
                     continue 'conn;
                 }
             };
+            debug_println(
+                debug,
+                format!("worker {tid}: response status={}", resp.status()),
+            );
             if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 let _ = evt_tx.send(Event::Error(format!(
                     "server did not return 206 Partial Content for bytes={}- (status={})",
                     pos,
                     resp.status()
                 )));
+                debug_println(
+                    debug,
+                    format!(
+                        "worker {tid}: expected 206 Partial Content, got status={} (pos={pos})",
+                        resp.status()
+                    ),
+                );
+                cancel.cancel();
+                break;
+            }
+            if let Err(e) =
+                validate_content_range(resp.headers().get(CONTENT_RANGE), pos, total_len)
+            {
+                let _ = evt_tx.send(Event::Error(format!("{e:#}")));
+                debug_println(debug, format!("worker {tid}: invalid Content-Range: {e:#}"));
+                cancel.cancel();
+                break;
+            }
+            if let Err(e) = validate_identity_encoding(resp.headers()) {
+                let _ = evt_tx.send(Event::Error(format!("{e:#}")));
+                debug_println(
+                    debug,
+                    format!("worker {tid}: invalid Content-Encoding: {e:#}"),
+                );
                 cancel.cancel();
                 break;
             }
@@ -1783,155 +2077,168 @@ async fn worker_loop(
                 }
 
                 tokio::select! {
-                    _ = cancel.cancelled() => break 'conn,
-                    msg = to_worker_rx.recv() => {
-                        match msg {
-                            Some(SchedToWorker::StealRequest { requester }) => {
-                                let stolen = steal_tail_half_blocks(&mut queue, &done, active_cells).await;
-                                let _ = to_sched_tx.send(WorkerToSched::StealReply { victim: tid, requester, stolen });
-                                let _ = to_sched_tx.send(WorkerToSched::Status { worker: tid, remaining_blocks: remaining_blocks_count(&queue, current) });
-                            }
-                            Some(SchedToWorker::Assign(blocks)) => {
-                                push_blocks(&mut queue, blocks);
-                            }
-                            Some(SchedToWorker::Stop) | None => break 'conn,
-                        }
-                    }
-                    next = tokio::time::timeout(per_read_timeout, stream.next()) => {
-                        let item = match next {
-                            Ok(v) => v,
-                            Err(_) => {
-                                errors.fetch_add(1, Ordering::Relaxed);
-                                *last_error.lock().await = format!("thread timeout: no bytes received for {:.0}s", per_read_timeout.as_secs_f64());
-                                if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
-                                break; // reopen connection at current pos
-                            }
-                        };
-                        let bytes = match item {
-                            Some(Ok(b)) => b,
-                            Some(Err(e)) => {
-                                errors.fetch_add(1, Ordering::Relaxed);
-                                *last_error.lock().await = format!("bytes stream error: {e}");
-                                if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
-                                break;
-                            }
-                            None => {
-                                // EOF: if we're done with all work, exit; otherwise retry.
-                                if current.is_none() && queue.is_empty() {
-                                    break 'conn;
-                                }
-                                errors.fetch_add(1, Ordering::Relaxed);
-                                *last_error.lock().await = "unexpected EOF".to_string();
-                                if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
-                                break;
-                            }
-                        };
-                        if bytes.is_empty() {
-                            continue;
-                        }
-
-                        received_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        if let Some(g) = global_received.as_ref() {
-                            g.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        }
-                        *last_progress.lock().await = Instant::now();
-                        stash.extend_from_slice(&bytes);
-
-                        // Consume stash across current and possibly subsequent contiguous blocks.
-                        loop {
-                            if stash.is_empty() {
-                                break;
-                            }
-                            let Some(cur) = current else { stash.clear(); break; };
-
-                            let (cur_start, cur_end) = block_byte_range(cur, bytes_per_cell, total_len);
-                            if pos < cur_start { pos = cur_start; }
-
-                            // If current is already complete, mark done and advance.
-                            if pos > cur_end {
-                                // mark done
-                                {
-                                    let mut bm = done.lock().await;
-                                    if cur < bm.len() && !bm[cur] {
-                                        bm[cur] = true;
-                                        meta_dirty.fetch_add(1, Ordering::Relaxed);
-                                        completed_bytes.fetch_add(cur_end - cur_start + 1, Ordering::Relaxed);
+                            _ = cancel.cancelled() => break 'conn,
+                            msg = to_worker_rx.recv() => {
+                                match msg {
+                                    Some(SchedToWorker::StealRequest { requester }) => {
+                                        let stolen = steal_tail_half_blocks(&mut queue, &done, active_cells).await;
+                                        let _ = to_sched_tx.send(WorkerToSched::StealReply { victim: tid, requester, stolen });
+                                        let _ = to_sched_tx.send(WorkerToSched::Status { worker: tid, remaining_blocks: remaining_blocks_count(&queue, current) });
                                     }
-                                }
-                                let _ = evt_tx.send(Event::ChunkDone(cur));
-                                current = pop_next_undone(&mut queue, &done, active_cells).await;
-                                started_current = false;
-                                if let Some(n) = current {
-                                    let (p, _) = block_byte_range(n, bytes_per_cell, total_len);
-                                    pos = p;
-                                }
-                                continue;
-                            }
-
-                            let need = (cur_end + 1 - pos) as usize;
-                            let take = need.min(stash.len());
-                            if take == 0 {
-                                break;
-                            }
-
-                            if !started_current {
-                                let _ = evt_tx.send(Event::ChunkStarted(cur));
-                                started_current = true;
-                            }
-
-                            let f = file.clone();
-                            let data = stash[..take].to_vec();
-                            let off = pos;
-                            tokio::task::spawn_blocking(move || {
-                                f.write_at(&data, off).context("failed writing to output file")?;
-                                Ok::<(), anyhow::Error>(())
-                            }).await.ok();
-
-                            pos += take as u64;
-                            stash.drain(..take);
-
-                            if pos == cur_end + 1 {
-                                // Completed this block.
-                                {
-                                    let mut bm = done.lock().await;
-                                    if cur < bm.len() && !bm[cur] {
-                                        bm[cur] = true;
-                                        meta_dirty.fetch_add(1, Ordering::Relaxed);
-                                        completed_bytes.fetch_add(cur_end - cur_start + 1, Ordering::Relaxed);
+                                    Some(SchedToWorker::Assign(blocks)) => {
+                                        push_blocks(&mut queue, blocks);
                                     }
+                                    Some(SchedToWorker::Stop) | None => break 'conn,
                                 }
-                                let _ = evt_tx.send(Event::ChunkDone(cur));
-                                started_current = false;
+                            }
+                            next = tokio::time::timeout(per_read_timeout, stream.next()) => {
+                                let item = match next {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        errors.fetch_add(1, Ordering::Relaxed);
+                                        *last_error.lock().await = format!("thread timeout: no bytes received for {:.0}s", per_read_timeout.as_secs_f64());
+                                        if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
+                                        break; // reopen connection at current pos
+                                    }
+                                };
+                                let bytes = match item {
+                                    Some(Ok(b)) => b,
+                                    Some(Err(e)) => {
+                                        errors.fetch_add(1, Ordering::Relaxed);
+                                        *last_error.lock().await = format!("bytes stream error: {e}");
+                                        if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
+                                        break;
+                                    }
+                                    None => {
+                                        // EOF: if we're done with all work, exit; otherwise retry.
+                                        if current.is_none() && queue.is_empty() {
+                                            break 'conn;
+                                        }
+                                        errors.fetch_add(1, Ordering::Relaxed);
+                                        *last_error.lock().await = "unexpected EOF".to_string();
+                                        if !backoff.is_zero() { tokio::time::sleep(backoff).await; }
+                                        break;
+                                    }
+                                };
+                                if bytes.is_empty() {
+                                    continue;
+                                }
 
-                                // Decide next block behavior with overread.
-                                let next = pop_next_undone(&mut queue, &done, active_cells).await;
-                                if let Some(nb) = next {
-                                    if nb == cur + 1 {
-                                        // continuous: keep connection and use overread.
-                                        current = Some(nb);
-                                        let (p, _) = block_byte_range(nb, bytes_per_cell, total_len);
-                                        pos = p; // should match cur_end+1
+                                received_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                                if let Some(g) = global_received.as_ref() {
+                                    g.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                                }
+                                *last_progress.lock().await = Instant::now();
+                                stash.extend_from_slice(&bytes);
+
+                                // Consume stash across current and possibly subsequent contiguous blocks.
+                                loop {
+                                    if stash.is_empty() {
+                                        break;
+                                    }
+                                    let Some(cur) = current else { stash.clear(); break; };
+
+                                    let (cur_start, cur_end) = block_byte_range(cur, bytes_per_cell, total_len);
+                                    if pos < cur_start { pos = cur_start; }
+
+                                    // If current is already complete, mark done and advance.
+                                    if pos > cur_end {
+                                        // mark done
+                                        {
+                                            let mut bm = done.lock().await;
+                                            if cur < bm.len() && !bm[cur] {
+                                                bm[cur] = true;
+                                                meta_dirty.fetch_add(1, Ordering::Relaxed);
+                                                completed_bytes.fetch_add(cur_end - cur_start + 1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        let _ = evt_tx.send(Event::ChunkDone(cur));
+                                        current = pop_next_undone(&mut queue, &done, active_cells).await;
+                                        started_current = false;
+                                        if let Some(n) = current {
+                                            let (p, _) = block_byte_range(n, bytes_per_cell, total_len);
+                                            pos = p;
+                                        }
                                         continue;
-                                    } else {
-                                        // discontinuous: discard overread, close connection, restart at next block.
-                                        stash.clear();
-                                        current = Some(nb);
-                                        let (p, _) = block_byte_range(nb, bytes_per_cell, total_len);
-                                        pos = p;
-                                        break 'conn;
                                     }
-                                } else {
-                                    // No more work.
-                                    stash.clear();
-                                    current = None;
-                                    break 'conn;
+
+                                    let need = (cur_end + 1 - pos) as usize;
+                                    let take = need.min(stash.len());
+                                    if take == 0 {
+                                        break;
+                                    }
+
+                                    if !started_current {
+                                        let _ = evt_tx.send(Event::ChunkStarted(cur));
+                                        started_current = true;
+                                    }
+
+                                    let f = file.clone();
+                                    let data = stash[..take].to_vec();
+                                    let off = pos;
+                                    let write_result = tokio::task::spawn_blocking(move || {
+                                        f.write_at(&data, off).context("failed writing to output file")?;
+                                        Ok::<(), anyhow::Error>(())
+                                    }).await;
+                                    match write_result {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            let _ = evt_tx.send(Event::Error(format!("{e:#}")));
+                                            cancel.cancel();
+                                            break 'conn;
+                                        }
+                                        Err(e) => {
+                                            let _ = evt_tx.send(Event::Error(format!("write task failed: {e}")));
+                                            cancel.cancel();
+                                            break 'conn;
+                                        }
+                                    }
+
+                                    pos += take as u64;
+                                    stash.drain(..take);
+
+                                    if pos == cur_end + 1 {
+                                        // Completed this block.
+                                        {
+                                            let mut bm = done.lock().await;
+                                            if cur < bm.len() && !bm[cur] {
+                                                bm[cur] = true;
+                                                meta_dirty.fetch_add(1, Ordering::Relaxed);
+                                                completed_bytes.fetch_add(cur_end - cur_start + 1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        let _ = evt_tx.send(Event::ChunkDone(cur));
+                                        started_current = false;
+
+                                        // Decide next block behavior with overread.
+                                        let next = pop_next_undone(&mut queue, &done, active_cells).await;
+                                        if let Some(nb) = next {
+                                            if nb == cur + 1 {
+                                                // continuous: keep connection and use overread.
+                                                current = Some(nb);
+                                                let (p, _) = block_byte_range(nb, bytes_per_cell, total_len);
+                                                pos = p; // should match cur_end+1
+                                                continue;
+                                            } else {
+                                                // discontinuous: discard overread, close connection, restart at next block.
+                                                stash.clear();
+                                                current = Some(nb);
+                                                let (p, _) = block_byte_range(nb, bytes_per_cell, total_len);
+                                                pos = p;
+                                                break 'conn;
+                                            }
+                                        } else {
+                                            // No more work.
+                                            stash.clear();
+                                            current = None;
+                                            break 'conn;
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
 
-        // Loop back to either continue with current block (reopened connection) or ask for more work.
-                }
+                // Loop back to either continue with current block (reopened connection) or ask for more work.
+                        }
             }
         }
 
@@ -1939,13 +2246,20 @@ async fn worker_loop(
     }
 }
 
-async fn probe_len_and_ranges(client: &reqwest::Client, url: &str) -> Result<ProbeInfo> {
+async fn probe_len_and_ranges(
+    client: &reqwest::Client,
+    url: &str,
+    debug: bool,
+) -> Result<ProbeInfo> {
     // Prefer HEAD, but fall back to GET if needed.
     let mut len: Option<u64> = None;
     let mut ranges_ok = false;
     let mut cd: Option<String> = None;
+    let mut etag: Option<String> = None;
+    let mut last_modified: Option<String> = None;
 
     if let Ok(resp) = client.head(url).send().await {
+        debug_println(debug, format!("probe: HEAD status={}", resp.status()));
         if resp.status().is_success() {
             len = parse_len(resp.headers().get(CONTENT_LENGTH));
             ranges_ok = parse_ranges(resp.headers().get(ACCEPT_RANGES));
@@ -1954,19 +2268,41 @@ async fn probe_len_and_ranges(client: &reqwest::Client, url: &str) -> Result<Pro
                 .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            etag = resp
+                .headers()
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            last_modified = resp
+                .headers()
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
         }
     }
 
-    if len.is_none() {
+    if len.is_none() || !ranges_ok {
         let resp = client
             .get(url)
             .header(RANGE, "bytes=0-0")
             .send()
             .await
             .context("failed to GET for probing")?;
+        debug_println(
+            debug,
+            format!("probe: GET bytes=0-0 status={}", resp.status()),
+        );
         // A 206 implies range support. Prefer Content-Range for total length.
-        ranges_ok = ranges_ok || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        len = len.or_else(|| parse_total_len_from_content_range(resp.headers().get(reqwest::header::CONTENT_RANGE)));
+        if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            ranges_ok = true;
+            len = len.or_else(|| {
+                parse_total_len_from_content_range(
+                    resp.headers().get(reqwest::header::CONTENT_RANGE),
+                )
+            });
+        } else if resp.status().is_success() {
+            ranges_ok = ranges_ok || parse_ranges(resp.headers().get(ACCEPT_RANGES));
+        }
         len = len.or_else(|| parse_len(resp.headers().get(CONTENT_LENGTH)));
         if cd.is_none() {
             cd = resp
@@ -1975,13 +2311,28 @@ async fn probe_len_and_ranges(client: &reqwest::Client, url: &str) -> Result<Pro
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
         }
+        if etag.is_none() {
+            etag = resp
+                .headers()
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+        }
+        if last_modified.is_none() {
+            last_modified = resp
+                .headers()
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+        }
     }
 
-    let len = len.ok_or_else(|| anyhow!("server did not provide Content-Length (needed for grid chunking)"))?;
     Ok(ProbeInfo {
         len,
         ranges_ok,
         content_disposition: cd,
+        etag,
+        last_modified,
     })
 }
 
@@ -2008,6 +2359,75 @@ fn parse_total_len_from_content_range(v: Option<&reqwest::header::HeaderValue>) 
     }
 }
 
+#[derive(Debug)]
+struct ParsedContentRange {
+    start: u64,
+    end: u64,
+    total: Option<u64>,
+}
+
+fn parse_content_range(v: Option<&reqwest::header::HeaderValue>) -> Option<ParsedContentRange> {
+    // Example: "bytes 100-199/12345"
+    let s = v?.to_str().ok()?.trim();
+    let rest = s.strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        n => Some(n.parse::<u64>().ok()?),
+    };
+    Some(ParsedContentRange { start, end, total })
+}
+
+fn validate_content_range(
+    v: Option<&reqwest::header::HeaderValue>,
+    requested_start: u64,
+    expected_total: u64,
+) -> Result<()> {
+    let cr = parse_content_range(v).ok_or_else(|| anyhow!("missing/invalid Content-Range"))?;
+    if cr.start != requested_start {
+        bail!(
+            "Content-Range start mismatch: requested {}, got {}",
+            requested_start,
+            cr.start
+        );
+    }
+    if cr.end < cr.start {
+        bail!("Content-Range end is before start: {}-{}", cr.start, cr.end);
+    }
+    if cr.end >= expected_total {
+        bail!(
+            "Content-Range end {} is outside expected total {}",
+            cr.end,
+            expected_total
+        );
+    }
+    if let Some(total) = cr.total {
+        if total != expected_total {
+            bail!(
+                "Content-Range total mismatch: expected {}, got {}",
+                expected_total,
+                total
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity_encoding(headers: &HeaderMap) -> Result<()> {
+    if let Some(value) = headers.get(CONTENT_ENCODING) {
+        let encoding = value.to_str().unwrap_or("<non-utf8>");
+        if !encoding.eq_ignore_ascii_case("identity") {
+            bail!(
+                "server returned Content-Encoding {encoding:?}; byte-exact downloads require identity encoding"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn default_output_path(url: &str) -> PathBuf {
     if let Ok(u) = Url::parse(url) {
         if let Some(seg) = u.path_segments().and_then(|mut it| it.next_back()) {
@@ -2019,11 +2439,7 @@ fn default_output_path(url: &str) -> PathBuf {
     PathBuf::from("download.bin")
 }
 
-fn render_grid(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    states: &[CellState],
-) {
+fn render_grid(f: &mut ratatui::Frame, area: Rect, states: &[CellState]) {
     let height = area.height as usize;
     let width = area.width as usize;
     if height == 0 || width == 0 {
@@ -2191,3 +2607,32 @@ fn format_noui_status_line(
     )
 }
 
+fn format_stream_status_line(
+    bytes: u64,
+    total_hint: Option<u64>,
+    speed_bps: f64,
+    idle: Duration,
+    read_timeouts: u64,
+    reason: StreamFallbackReason,
+) -> String {
+    let bytes_hr = human_bytes(bytes as f64);
+    let suffix = format!(
+        "idle {:.0}s  read_timeouts {read_timeouts}  resume unavailable ({})",
+        idle.as_secs_f64(),
+        reason.label()
+    );
+    match total_hint {
+        Some(total) if total > 0 => {
+            let total_hr = human_bytes(total as f64);
+            let pct = ((bytes.min(total) as f64) * 100.0 / (total as f64)).min(100.0);
+            format!(
+                "stream {pct:6.2}%  {bytes_hr}/{total_hr}  {}/s  {suffix}",
+                human_bytes(speed_bps),
+            )
+        }
+        _ => format!(
+            "stream  {bytes_hr} downloaded  {}/s  total unknown  {suffix}",
+            human_bytes(speed_bps),
+        ),
+    }
+}

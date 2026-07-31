@@ -1,0 +1,2 @@
+noprofile
+copy target/x86_64-unknown-linux-musl/release/pwget oss://fleetman/prod/staging/pwget/pwget

@@ -18,6 +18,8 @@ It also supports:
 ## Features
 
 - **Parallel range downloads**: `-n` sets the initially enabled worker count.
+- **Sequential stream fallback**: if a server does not provide `Content-Length` or byte ranges,
+  `pwget` falls back to a single streaming download with simple progress.
 - **Hard cap**: `-N` sets the maximum worker pool size for a download (default `20`).
 - **Interactive worker scaling** (TTY):
   - **Ctrl+I / Tab**: increase enabled workers (up to `-N`)
@@ -77,6 +79,35 @@ Disable TUI (line-based status):
 pwget https://example.com/file.bin --noui
 ```
 
+Debug (prints HTTP/probe/worker events; forces `--noui` to avoid corrupting the TUI):
+
+```bash
+pwget https://example.com/file.bin --debug
+```
+
+Custom User-Agent:
+
+```bash
+pwget https://example.com/file.bin --ua "Mozilla/5.0 (pwget)"
+```
+
+Extra headers (repeatable, `KEY=VALUE`):
+
+```bash
+pwget https://example.com/file.bin \
+  --header "Authorization=Bearer TOKEN" \
+  --header "Accept=application/octet-stream"
+```
+
+You can also use `KEY:VALUE`:
+
+```bash
+pwget https://example.com/file.bin --header "X-LXC-No-GeoIP:on"
+```
+
+`Range` and `Accept-Encoding` are managed by `pwget` and cannot be overridden. Downloads force
+`Accept-Encoding: identity` so byte ranges, resume metadata, and output bytes stay consistent.
+
 Worker controls:
 - `-n`: initial enabled workers (default `5`)
 - `-N`: hard limit max workers (default `20`)
@@ -100,6 +131,13 @@ It stores:
 - done bitmap
 
 On completion, the `.meta` file is removed.
+
+Resume requires a known `Content-Length` and byte range support. Unknown-length streams use
+single-stream mode, which cannot safely resume because there is no stable total size/block map to
+validate against.
+
+Range support is probed with `HEAD` first and then a tiny `GET bytes=0-0` request when needed, since
+some servers support ranges without advertising them in `HEAD`.
 
 ---
 
@@ -225,5 +263,3 @@ pwget https://example.com/file.bin
 - The “true parallel” downloader requires the server to support **range requests** (`206 Partial Content`).
 - The UI reserves the **last terminal row** for the status line.
 - If the terminal is resized, the UI grid is re-mapped on redraw.
-
-

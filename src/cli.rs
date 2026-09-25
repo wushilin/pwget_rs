@@ -12,8 +12,12 @@ use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderName, HeaderValue, RANGE
 )]
 pub struct Cli {
     /// URL to download (single-file mode). Omit when using -T.
-    #[arg(required_unless_present = "url_list")]
+    #[arg(required_unless_present_any = ["url_list", "self_update"])]
     pub url: Option<String>,
+
+    /// Replace this executable with the matching binary from the latest GitHub release
+    #[arg(long = "self-update", conflicts_with_all = ["url", "url_list", "output", "download_dir", "meta"])]
+    pub self_update: bool,
 
     /// Number of download threads
     #[arg(short = 'n', long = "threads", default_value_t = 5)]
@@ -127,4 +131,24 @@ pub fn parse_extra_headers(cli: &Cli) -> Result<(Option<String>, HeaderMap)> {
         out.insert(name, value);
     }
     Ok((ua, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn self_update_does_not_require_a_download_url() {
+        let cli = Cli::try_parse_from(["pwget", "--self-update"]).unwrap();
+        assert!(cli.self_update);
+        assert!(cli.url.is_none());
+    }
+
+    #[test]
+    fn self_update_rejects_a_download_url() {
+        assert!(
+            Cli::try_parse_from(["pwget", "--self-update", "https://example.test/file"]).is_err()
+        );
+    }
 }

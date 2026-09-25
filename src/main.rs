@@ -35,6 +35,7 @@ mod meta;
 mod output;
 mod progress;
 mod range;
+mod update;
 
 use crate::batch::parse_url_list;
 use crate::cli::{Cli, parse_extra_headers};
@@ -181,6 +182,10 @@ fn cancellation_error(events: &mut mpsc::UnboundedReceiver<Event>) -> anyhow::Er
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.self_update {
+        update::self_update().await?;
+        return Ok(());
+    }
     if cli.hard_limit > 20 {
         eprintln!(
             "warning: -N {} is high (> 20) and may spam the server / get you rate-limited.",

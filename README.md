@@ -48,6 +48,17 @@ Run:
 cargo run -- <URL> [args...]
 ```
 
+Update an installed binary to the latest matching GitHub release asset:
+
+```bash
+pwget --self-update
+```
+
+The updater verifies the asset's SHA-256 digest from GitHub release metadata and
+checks the downloaded binary's version before atomically replacing the current
+executable. Supported assets are macOS arm64/x86_64, FreeBSD x86_64, and Linux
+arm64/x86_64 (musl).
+
 Binary output (example toolchain path shown by Cargo):
 - `target/**/debug/pwget`
 

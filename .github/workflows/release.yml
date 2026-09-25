@@ -2,6 +2,11 @@ name: Release binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag whose source should be built and released (for example v0.2.0)
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -23,6 +28,8 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -46,6 +53,8 @@ jobs:
           - x86_64-unknown-freebsd
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
@@ -69,5 +78,6 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           files: dist/*

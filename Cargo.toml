@@ -1,7 +1,8 @@
 [package]
 name = "pwget_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 
 [[bin]]
 name = "pwget"
@@ -9,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.95"
+crc32fast = "1.4.2"
 clap = { version = "4.5.23", features = ["derive"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"

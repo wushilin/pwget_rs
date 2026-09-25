@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(long = "timeout", default_value_t = 60)]
     pub timeout_secs: u64,
 
-    /// Per-thread timeout: if a range request doesn't complete within this many seconds, retry
+    /// Per-thread stall timeout: retry if this worker receives no bytes for this many seconds
     #[arg(long = "ttimeout", default_value_t = 10)]
     pub thread_timeout_secs: u64,
 

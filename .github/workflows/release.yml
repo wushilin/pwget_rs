@@ -1,0 +1,72 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target "${{ matrix.target }}"
+      - run: mkdir -p dist && install -m 755 "target/${{ matrix.target }}/release/pwget" "dist/pwget-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pwget-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  portable:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-freebsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --locked --release
+      - run: mkdir -p dist && install -m 755 "target/${{ matrix.target }}/release/pwget" "dist/pwget-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pwget-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [macos, portable]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

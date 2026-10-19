@@ -147,6 +147,27 @@ pub(crate) async fn scheduler_loop(
 ) {
     let mut remaining: Vec<usize> = vec![0; worker_count];
     let mut owner_assigned = false;
+    // Workers that asked for work before thread 0 received the initial blocks. Their requests
+    // are replayed once thread 0 owns the work; otherwise they would idle until their retry.
+    let mut early_requests: Vec<usize> = Vec::new();
+
+    // Ask the worker with the most remaining blocks to give half to `worker`.
+    let request_steal = |remaining: &[usize], worker: usize| {
+        let mut best: Option<(usize, usize)> = None;
+        for (tid, &remaining_blocks) in remaining.iter().enumerate() {
+            if tid == worker {
+                continue;
+            }
+            if remaining_blocks > best.map(|(_, count)| count).unwrap_or(0) {
+                best = Some((tid, remaining_blocks));
+            }
+        }
+        if let Some((victim, remaining_blocks)) = best
+            && remaining_blocks >= 2
+        {
+            let _ = to_workers[victim].send(SchedToWorker::StealRequest { requester: worker });
+        }
+    };
 
     while !cancel.is_cancelled() {
         // If everything is done, ask all workers to stop and exit scheduler.
@@ -175,30 +196,20 @@ pub(crate) async fn scheduler_loop(
 
                 // Ensure thread 0 is the initial owner (start 1 thread first).
                 if !owner_assigned {
-                    if worker == 0 {
-                        owner_assigned = true;
-                        remaining[0] = initial_work.len();
-                        let _ = to_workers[0].send(SchedToWorker::Assign(initial_work.clone()));
+                    if worker != 0 {
+                        early_requests.push(worker);
+                        continue;
+                    }
+                    owner_assigned = true;
+                    remaining[0] = initial_work.len();
+                    let _ = to_workers[0].send(SchedToWorker::Assign(initial_work.clone()));
+                    for early in early_requests.drain(..) {
+                        request_steal(&remaining, early);
                     }
                     continue;
                 }
 
-                // Find a victim with most remaining blocks.
-                let mut best: Option<(usize, usize)> = None;
-                for (tid, &remaining_blocks) in remaining.iter().enumerate() {
-                    if tid == worker {
-                        continue;
-                    }
-                    if remaining_blocks > best.map(|(_, count)| count).unwrap_or(0) {
-                        best = Some((tid, remaining_blocks));
-                    }
-                }
-                if let Some((victim, remaining_blocks)) = best
-                    && remaining_blocks >= 2
-                {
-                    let _ =
-                        to_workers[victim].send(SchedToWorker::StealRequest { requester: worker });
-                }
+                request_steal(&remaining, worker);
             }
             WorkerToSched::Status {
                 worker,
@@ -766,5 +777,64 @@ pub(crate) async fn worker_loop(
         }
 
         requested_work = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Worker tasks start in any order; one that asks before thread 0 must still be served.
+    #[tokio::test]
+    async fn replays_work_requests_sent_before_thread_zero() {
+        let (sched_tx, mut sched_rx) = mpsc::unbounded_channel();
+        let mut worker_txs = Vec::new();
+        let mut worker_rxs = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            worker_txs.push(tx);
+            worker_rxs.push(rx);
+        }
+        let done = Arc::new(Mutex::new(vec![false; 8]));
+        let cancel = CancellationToken::new();
+        let scheduler = tokio::spawn({
+            let done = done.clone();
+            let cancel = cancel.clone();
+            async move {
+                scheduler_loop(
+                    2,
+                    8,
+                    worker_txs,
+                    &mut sched_rx,
+                    done,
+                    (0..8).collect(),
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        sched_tx
+            .send(WorkerToSched::NeedWork { worker: 1 })
+            .unwrap();
+        sched_tx
+            .send(WorkerToSched::NeedWork { worker: 0 })
+            .unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), worker_rxs[0].recv())
+                .await
+                .unwrap(),
+            Some(SchedToWorker::Assign(blocks)) if blocks.len() == 8
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), worker_rxs[0].recv())
+                .await
+                .unwrap(),
+            Some(SchedToWorker::StealRequest { requester: 1 })
+        ));
+
+        cancel.cancel();
+        scheduler.await.unwrap();
     }
 }

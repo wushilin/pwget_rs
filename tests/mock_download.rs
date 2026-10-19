@@ -947,7 +947,7 @@ fn resolve_override_rejects_a_rule_for_a_different_port() {
     let result = pwget(
         "http://pwget-resolve.test:8080/file.bin",
         &dir.0.join("file.bin"),
-        &["--resolve", "pwget-resolve.test:80::127.0.0.1:1"],
+        &["--resolve", "pwget-resolve.test:80::127.0.0.1:80"],
     );
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("--resolve rule"));

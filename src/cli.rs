@@ -87,7 +87,7 @@ pub struct Cli {
     /// Override where connections to HOST:PORT go (repeatable), e.g.
     /// www.google.com:443::127.0.0.1:1443 or www.google.com:443::www.yahoo.com.sg:15423.
     /// TLS SNI, certificate checks, and the Host header still use the original HOST.
-    #[arg(long = "resolve", value_name = "HOST:PORT::TARGET[:PORT]", action = clap::ArgAction::Append)]
+    #[arg(long = "resolve", value_name = "HOST:PORT::TARGET:PORT", action = clap::ArgAction::Append)]
     pub resolve: Vec<String>,
 
     /// Skip TLS certificate and hostname verification (insecure)

@@ -143,7 +143,8 @@ pwget https://example.com/file.bin --header "X-LXC-No-GeoIP:on"
 
 Override where connections go, like curl's `--resolve` (repeatable). The format is
 `HOST:PORT::TARGET:TARGET_PORT`, and both ports are required. `HOST` must be a host name;
-`TARGET` may be a host name, an IPv4 address, or an IPv6 address (brackets optional, e.g.
+`TARGET` may be a host name, an IPv4 address, or an IPv6 address (brackets are optional around
+IP addresses and not allowed around host names, e.g.
 `www.google.com:443::2001:db8::1:8443` or `www.google.com:443::[2001:db8::1]:8443`). The first
 `::` ends `HOST:PORT` and the last `:` starts `TARGET_PORT`. Malformed rules are rejected with the
 reason:

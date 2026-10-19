@@ -84,10 +84,28 @@ pub struct Cli {
     #[arg(long = "header", value_name = "KEY=VALUE|KEY:VALUE", action = clap::ArgAction::Append)]
     pub header: Vec<String>,
 
-    /// Override where connections to HOST:PORT go (repeatable), e.g.
-    /// www.google.com:443::127.0.0.1:1443 or www.google.com:443::www.yahoo.com.sg:15423.
-    /// TLS SNI, certificate checks, and the Host header still use the original HOST.
-    #[arg(long = "resolve", value_name = "HOST:PORT::TARGET:PORT", action = clap::ArgAction::Append)]
+    /// Send connections for HOST:PORT to TARGET:PORT instead (repeatable)
+    ///
+    /// Format: HOST:PORT::TARGET:TARGET_PORT. Both ports are required.
+    ///
+    ///   HOST     host name from the URL (not an IP address; IP URLs never use DNS)
+    ///   TARGET   host name, IPv4, or IPv6 address; IP addresses may be bracketed
+    ///
+    /// The first "::" ends HOST:PORT and the last ":" starts TARGET_PORT, so IPv6
+    /// targets work with or without brackets. TLS SNI, certificate checks, and the
+    /// Host header still use HOST. One rule per HOST.
+    ///
+    /// Examples:
+    ///   --resolve www.google.com:443::127.0.0.1:1443
+    ///   --resolve www.google.com:443::www.yahoo.com.sg:15423
+    ///   --resolve www.google.com:443::2001:db8::1:8443
+    ///   --resolve www.google.com:443::[2001:db8::1]:8443
+    #[arg(
+        long = "resolve",
+        value_name = "HOST:PORT::TARGET:PORT",
+        action = clap::ArgAction::Append,
+        verbatim_doc_comment
+    )]
     pub resolve: Vec<String>,
 
     /// Skip TLS certificate and hostname verification (insecure)

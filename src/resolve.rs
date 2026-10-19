@@ -73,6 +73,11 @@ fn parse_host(host: &str) -> std::result::Result<Target, String> {
     if let Ok(ip) = unbracketed.parse::<IpAddr>() {
         return Ok(Target::Ip(ip));
     }
+    if unbracketed.len() != host.len() {
+        return Err(format!(
+            "{host:?}: brackets are only allowed around IPv4 or IPv6 addresses"
+        ));
+    }
     if host.contains([':', '[', ']']) {
         return Err(format!(
             "{host:?} is not a valid IPv6 address (is the :TARGET_PORT missing?)"
@@ -223,6 +228,10 @@ mod tests {
                 rule("example.com", 443, "2001:db8::1", 443),
             ),
             (
+                "example.com:443::[10.0.0.1]:1443",
+                rule("example.com", 443, "10.0.0.1", 1443),
+            ),
+            (
                 "example.com:443::::1:1443",
                 rule("example.com", 443, "::1", 1443),
             ),
@@ -255,6 +264,7 @@ mod tests {
             "exa mple.com:443::127.0.0.1:1443",
             "example.com:443::exa mple.com:1443",
             "127.0.0.1:443::10.0.0.1:1443",
+            "example.com:443::[www.yahoo.com]:1443",
         ] {
             assert!(parse_resolve_rule(raw).is_err(), "{raw} should be rejected");
         }

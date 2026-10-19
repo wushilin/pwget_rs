@@ -142,8 +142,9 @@ pwget https://example.com/file.bin --header "X-LXC-No-GeoIP:on"
 `Accept-Encoding: identity` so byte ranges, resume metadata, and output bytes stay consistent.
 
 Override where connections go, like curl's `--resolve` (repeatable). The format is
-`HOST:PORT::TARGET[:TARGET_PORT]`; `TARGET` may be an IP address or another host name, and
-`TARGET_PORT` defaults to `PORT`:
+`HOST:PORT::TARGET[:TARGET_PORT]`; `HOST` must be a host name, `TARGET` may be an IP address or
+another host name, IPv6 addresses must be bracketed (`[2001:db8::1]:8443`), and `TARGET_PORT`
+defaults to `PORT`. Malformed rules are rejected with the reason:
 
 ```bash
 pwget https://www.google.com/file.bin --resolve www.google.com:443::127.0.0.1:1443

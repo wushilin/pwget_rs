@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::{Error, ErrorKind, Result as IoResult},
-    os::unix::fs::FileExt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -78,10 +77,47 @@ pub(crate) fn checksum_file_range(file: &File, start: u64, end: u64) -> anyhow::
     Ok(hasher.finalize())
 }
 
+// Positional I/O lets concurrent workers share one file handle without seeking.
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> IoResult<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> IoResult<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, data: &[u8], offset: u64) -> IoResult<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> IoResult<()> {
+    while !data.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(file, data, offset) {
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(written) => {
+                data = &data[written..];
+                offset += written as u64;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> IoResult<usize> {
     let mut total = 0;
     while total < buffer.len() {
-        match file.read_at(&mut buffer[total..], offset + total as u64) {
+        match read_at(file, &mut buffer[total..], offset + total as u64) {
             Ok(0) => break,
             Ok(read) => total += read,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -651,7 +687,7 @@ pub(crate) async fn worker_loop(
                                     let data = stash[..take].to_vec();
                                     let off = pos;
                                     let write_result = tokio::task::spawn_blocking(move || {
-                                        f.write_all_at(&data, off)
+                                        write_all_at(&f, &data, off)
                                             .context("failed writing to output file")?;
                                         Ok::<(), anyhow::Error>(())
                                     }).await;

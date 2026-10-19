@@ -16,45 +16,101 @@ pub(crate) struct ResolveRule {
 }
 
 pub(crate) fn parse_resolve_rule(raw: &str) -> Result<ResolveRule> {
-    let err = || anyhow!("invalid --resolve {raw:?}: expected HOST:PORT::TARGET[:TARGET_PORT]");
-    let (host, rest) = split_host(raw).ok_or_else(err)?;
-    let (port, target) = rest
-        .strip_prefix(':')
-        .and_then(|rest| rest.split_once("::"))
-        .ok_or_else(err)?;
-    let port = parse_port(port).ok_or_else(err)?;
-    let (target_host, target_rest) = split_host(target).ok_or_else(err)?;
-    let target_port = match target_rest {
-        "" => port,
-        rest => rest
-            .strip_prefix(':')
-            .and_then(parse_port)
-            .ok_or_else(err)?,
+    parse_rule_parts(raw).map_err(|reason| {
+        anyhow!("invalid --resolve {raw:?}: {reason} (expected HOST:PORT::TARGET[:TARGET_PORT], with IPv6 addresses in brackets)")
+    })
+}
+
+fn parse_rule_parts(raw: &str) -> std::result::Result<ResolveRule, String> {
+    let (host, rest) = split_host(raw)?;
+    let host = match normalize_host(host)? {
+        NormalizedHost::Domain(host) => host,
+        NormalizedHost::Ip(ip) => {
+            return Err(format!(
+                "source host {ip} is an IP address, which is never resolved through DNS"
+            ));
+        }
     };
-    if host.is_empty() || target_host.is_empty() {
-        return Err(err());
-    }
+    let (port, rest) = split_port(rest)
+        .filter(|(port, _)| !port.is_empty())
+        .ok_or("missing :PORT after the source host")?;
+    let port = parse_port(port)?;
+    let target = rest
+        .strip_prefix("::")
+        .ok_or("missing :: between the source and the target")?;
+    let (target_host, rest) = split_host(target)?;
+    let target_host = match normalize_host(target_host)? {
+        NormalizedHost::Domain(host) => host,
+        NormalizedHost::Ip(ip) => ip.to_string(),
+    };
+    let target_port = match split_port(rest) {
+        Some(("", "")) => port,
+        Some((target_port, "")) => parse_port(target_port)?,
+        _ => return Err(format!("unexpected {rest:?} after the target host")),
+    };
     Ok(ResolveRule {
-        host: host.to_ascii_lowercase(),
+        host,
         port,
-        target_host: target_host.to_string(),
+        target_host,
         target_port,
     })
 }
 
-/// Splits a leading host (bracketed for IPv6) from the rest of the string.
-fn split_host(value: &str) -> Option<(&str, &str)> {
-    if let Some(inner) = value.strip_prefix('[') {
-        let end = inner.find(']')?;
-        Some((&inner[..end], &inner[end + 1..]))
+enum NormalizedHost {
+    Domain(String),
+    Ip(IpAddr),
+}
+
+/// Splits a leading host from the rest of the string. IPv6 addresses must be bracketed, so an
+/// unbracketed host never contains `:`.
+fn split_host(value: &str) -> std::result::Result<(&str, &str), String> {
+    let (host, rest) = if let Some(inner) = value.strip_prefix('[') {
+        let end = inner.find(']').ok_or("missing ']' after an IPv6 address")?;
+        let host = &inner[..end];
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("[{host}] is not a valid IPv6 address"))?;
+        (host, &inner[end + 1..])
     } else {
         let end = value.find(':').unwrap_or(value.len());
-        Some((&value[..end], &value[end..]))
+        (&value[..end], &value[end..])
+    };
+    if host.is_empty() {
+        return Err("missing host".into());
+    }
+    Ok((host, rest))
+}
+
+fn normalize_host(host: &str) -> std::result::Result<NormalizedHost, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(NormalizedHost::Ip(ip));
+    }
+    match url::Host::parse(host) {
+        Ok(url::Host::Domain(domain)) => Ok(NormalizedHost::Domain(domain)),
+        Ok(url::Host::Ipv4(ip)) => Ok(NormalizedHost::Ip(ip.into())),
+        Ok(url::Host::Ipv6(ip)) => Ok(NormalizedHost::Ip(ip.into())),
+        Err(_) => Err(format!("{host:?} is not a valid host name")),
     }
 }
 
-fn parse_port(value: &str) -> Option<u16> {
-    value.parse().ok().filter(|port| *port != 0)
+/// Splits `:PORT` (digits only) from the start of `rest`. Returns an empty port when `rest` does
+/// not start with `:` followed by a digit.
+fn split_port(rest: &str) -> Option<(&str, &str)> {
+    if rest.is_empty() || rest.starts_with("::") {
+        return Some(("", rest));
+    }
+    let digits = rest.strip_prefix(':')?;
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    Some((&digits[..end], &digits[end..]))
+}
+
+fn parse_port(value: &str) -> std::result::Result<u16, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("{value:?} is not a valid port (1-65535)"))
 }
 
 /// DNS resolver that redirects connections for overridden hosts and falls back to the system
@@ -177,8 +233,12 @@ mod tests {
             rule("example.com", 80, "10.0.0.1", 80)
         );
         assert_eq!(
-            parse_resolve_rule("[::1]:443::[fe80::1]:8443").unwrap(),
-            rule("::1", 443, "fe80::1", 8443)
+            parse_resolve_rule("example.com:443::[fe80::1]:8443").unwrap(),
+            rule("example.com", 443, "fe80::1", 8443)
+        );
+        assert_eq!(
+            parse_resolve_rule("example.com:443::[::1]").unwrap(),
+            rule("example.com", 443, "::1", 443)
         );
     }
 
@@ -193,8 +253,28 @@ mod tests {
             "example.com:443::",
             "example.com:443::127.0.0.1:x",
             ":443::127.0.0.1",
+            "example.com:443::127.0.0.1:443:extra",
+            "example.com:443::127.0.0.1:99999",
+            "example.com:443x::127.0.0.1",
+            "exa mple.com:443::127.0.0.1",
+            "example.com:443::[not-ipv6]:443",
+            "example.com:443::[::1:443",
+            "127.0.0.1:443::10.0.0.1",
+            "[::1]:443::10.0.0.1",
         ] {
             assert!(parse_resolve_rule(raw).is_err(), "{raw} should be rejected");
+        }
+    }
+
+    #[test]
+    fn explains_unbracketed_ipv6() {
+        for raw in [
+            "example.com:443::fe80::1",
+            "example.com:443::2001:db8::1:8443",
+            "::1:443::127.0.0.1",
+        ] {
+            let error = parse_resolve_rule(raw).unwrap_err().to_string();
+            assert!(error.contains("IPv6 addresses in brackets"), "{error}");
         }
     }
 

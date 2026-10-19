@@ -103,6 +103,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      # The build record artifact cannot be fetched by actions/download-artifact.
+      DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,6 +151,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: pwget-*
           path: dist
           merge-multiple: true
       - uses: softprops/action-gh-release@v2

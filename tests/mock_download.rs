@@ -288,7 +288,7 @@ fn handle_scenario(stream: &mut TcpStream, seed: u64, broken_routes: Arc<Mutex<H
     if start >= len {
         let _ = write!(
             stream,
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\n\r\n"
         );
         return;
     }
@@ -379,7 +379,7 @@ fn handle_request(
     {
         write!(
             stream,
-            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 412 Precondition Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         )
         .unwrap();
         return;
@@ -393,7 +393,7 @@ fn handle_request(
         };
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{}{}{}\r\n",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{}{}{}\r\n",
             body.len(),
             etag_header,
             last_modified_header,
@@ -415,7 +415,7 @@ fn handle_request(
     if matches!(mode, ServerMode::IgnoreRanges) || range_start.is_none() {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{}{}\r\n",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{}{}\r\n",
             body.len(),
             etag_header,
             last_modified_header
@@ -436,7 +436,7 @@ fn handle_request(
     if start >= body.len() {
         write!(
             stream,
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
             body.len()
         )
         .unwrap();
@@ -445,7 +445,7 @@ fn handle_request(
     let remaining_len = body.len() - start;
     write!(
         stream,
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n{}{}\r\n",
+        "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n{}{}\r\n",
         remaining_len,
         start,
         body.len() - 1,

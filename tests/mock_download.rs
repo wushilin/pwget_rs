@@ -61,6 +61,9 @@ impl Payload {
                     }
                     stream.write_all(&buffer[..chunk_len])?;
                     offset += chunk_len;
+                    // Pace generated payloads (~64 MiB/s) so a fast machine cannot finish on
+                    // the first worker before idle workers get a chance to steal blocks.
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Ok(())
             }

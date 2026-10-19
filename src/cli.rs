@@ -84,6 +84,16 @@ pub struct Cli {
     #[arg(long = "header", value_name = "KEY=VALUE|KEY:VALUE", action = clap::ArgAction::Append)]
     pub header: Vec<String>,
 
+    /// Override where connections to HOST:PORT go (repeatable), e.g.
+    /// www.google.com:443::127.0.0.1:1443 or www.google.com:443::www.yahoo.com.sg:15423.
+    /// TLS SNI, certificate checks, and the Host header still use the original HOST.
+    #[arg(long = "resolve", value_name = "HOST:PORT::TARGET[:PORT]", action = clap::ArgAction::Append)]
+    pub resolve: Vec<String>,
+
+    /// Skip TLS certificate and hostname verification (insecure)
+    #[arg(short = 'k', long = "insecure")]
+    pub insecure: bool,
+
     /// Debug logging (forces --noui to avoid corrupting the TUI)
     #[arg(long = "debug")]
     pub debug: bool,

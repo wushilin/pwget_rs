@@ -35,6 +35,7 @@ mod meta;
 mod output;
 mod progress;
 mod range;
+mod resolve;
 mod update;
 
 use crate::batch::parse_url_list;
@@ -55,6 +56,7 @@ use crate::range::{
     Event, SchedToWorker, WorkerContext, WorkerToSched, block_byte_range, checksum_file_range,
     find_all_undone_blocks, scheduler_loop, worker_loop,
 };
+use crate::resolve::ResolveOverrides;
 
 pub(crate) fn debug_println(enabled: bool, msg: impl AsRef<str>) {
     if !enabled {
@@ -221,6 +223,15 @@ async fn main() -> Result<()> {
         .connect_timeout(Duration::from_secs(cli.thread_timeout_secs.max(1)))
         .pool_max_idle_per_host(cli.hard_limit.max(1) * cli.parallel.max(1));
     builder = builder.user_agent(ua.unwrap_or_else(|| "pwget/0.1".to_string()));
+    let resolve_overrides = ResolveOverrides::from_args(&cli.resolve)?;
+    if !resolve_overrides.is_empty() {
+        builder = builder.dns_resolver(resolve_overrides.clone());
+    }
+    if cli.insecure {
+        builder = builder
+            .tls_danger_accept_invalid_certs(true)
+            .tls_danger_accept_invalid_hostnames(true);
+    }
     let client = builder.build().context("failed to build HTTP client")?;
 
     // Batch mode (-T): force --noui and require -d.
@@ -249,6 +260,9 @@ async fn main() -> Result<()> {
         })?;
         if items.is_empty() {
             bail!("urllist is empty: {}", list_path.display());
+        }
+        for item in &items {
+            resolve_overrides.check_url(&item.url)?;
         }
 
         let batch = BatchProgress {
@@ -416,6 +430,7 @@ async fn main() -> Result<()> {
         .url
         .clone()
         .ok_or_else(|| anyhow!("missing URL (or use -T for batch mode)"))?;
+    resolve_overrides.check_url(&url)?;
     let _rep = run_one_download(
         &cli,
         client.clone(),

@@ -916,3 +916,39 @@ fn ordinary_batch_download_failures_return_nonzero() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("1 batch download(s) failed"));
 }
+
+#[test]
+fn resolve_override_redirects_connections_to_another_address_and_port() {
+    let body = b"payload served through a --resolve override".to_vec();
+    let server = MockServer::start(body.clone(), "\"v1\"", ServerMode::Ranges);
+    let port = server.address.rsplit(':').next().unwrap();
+    let dir = TestDir::new("resolve");
+    for (name, target) in [("ip", "127.0.0.1"), ("host", "localhost")] {
+        let output = dir.0.join(format!("{name}.bin"));
+        let rule = format!("pwget-resolve.test:80::{target}:{port}");
+        let result = Command::new(env!("CARGO_BIN_EXE_pwget"))
+            .args(["http://pwget-resolve.test/file.bin", "--noui", "--yes"])
+            .args(["--timeout", "5", "--resolve", &rule, "-o"])
+            .arg(&output)
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
+            .output()
+            .unwrap();
+        assert_success(result);
+        assert_eq!(fs::read(&output).unwrap(), body);
+    }
+}
+
+#[test]
+fn resolve_override_rejects_a_rule_for_a_different_port() {
+    let dir = TestDir::new("resolve-port");
+    let result = pwget(
+        "http://pwget-resolve.test:8080/file.bin",
+        &dir.0.join("file.bin"),
+        &["--resolve", "pwget-resolve.test:80::127.0.0.1:1"],
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--resolve rule"));
+}

@@ -176,6 +176,8 @@ impl ScenarioServer {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows sockets inherit the listener's non-blocking mode.
+                        stream.set_nonblocking(false).unwrap();
                         let routes = routes_thread.clone();
                         thread::spawn(move || handle_scenario(&mut stream, seed, routes));
                     }

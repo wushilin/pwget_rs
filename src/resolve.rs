@@ -1,0 +1,306 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use url::Url;
+
+/// One `--resolve HOST:PORT::TARGET:TARGET_PORT` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolveRule {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) target_host: String,
+    pub(crate) target_port: u16,
+}
+
+pub(crate) fn parse_resolve_rule(raw: &str) -> Result<ResolveRule> {
+    parse_rule_parts(raw).map_err(|reason| {
+        anyhow!("invalid --resolve {raw:?}: {reason} (expected HOST:PORT::TARGET:TARGET_PORT)")
+    })
+}
+
+/// `HOST` is a host name and cannot contain `:`, so the first `::` separates source from
+/// target. Both ports are required, so the last `:` of the target always starts its port, which
+/// lets the target be an unbracketed IPv6 address.
+fn parse_rule_parts(raw: &str) -> std::result::Result<ResolveRule, String> {
+    let (source, target) = raw
+        .split_once("::")
+        .ok_or("missing :: between HOST:PORT and TARGET:TARGET_PORT")?;
+    let (host, port) = source
+        .split_once(':')
+        .ok_or("missing :PORT after the source host")?;
+    let host = match parse_host(host)? {
+        Target::Domain(host) => host,
+        Target::Ip(ip) => {
+            return Err(format!(
+                "source host {ip} is an IP address, which is never resolved through DNS"
+            ));
+        }
+    };
+    let port = parse_port(port)?;
+    let (target_host, target_port) = target
+        .rsplit_once(':')
+        .ok_or("missing :TARGET_PORT after the target")?;
+    let target_host = match parse_host(target_host)? {
+        Target::Domain(host) => host,
+        Target::Ip(ip) => ip.to_string(),
+    };
+    let target_port = parse_port(target_port)?;
+    Ok(ResolveRule {
+        host,
+        port,
+        target_host,
+        target_port,
+    })
+}
+
+enum Target {
+    Domain(String),
+    Ip(IpAddr),
+}
+
+/// Accepts a host name, an IPv4 address, or an IPv6 address (optionally bracketed).
+fn parse_host(host: &str) -> std::result::Result<Target, String> {
+    if host.is_empty() {
+        return Err("missing host".into());
+    }
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return Ok(Target::Ip(ip));
+    }
+    if unbracketed.len() != host.len() {
+        return Err(format!(
+            "{host:?}: brackets are only allowed around IPv4 or IPv6 addresses"
+        ));
+    }
+    if host.contains([':', '[', ']']) {
+        return Err(format!(
+            "{host:?} is not a valid IPv6 address (is the :TARGET_PORT missing?)"
+        ));
+    }
+    match url::Host::parse(host) {
+        Ok(url::Host::Domain(domain)) => Ok(Target::Domain(domain)),
+        Ok(url::Host::Ipv4(ip)) => Ok(Target::Ip(ip.into())),
+        Ok(url::Host::Ipv6(ip)) => Ok(Target::Ip(ip.into())),
+        Err(_) => Err(format!("{host:?} is not a valid host name")),
+    }
+}
+
+fn parse_port(value: &str) -> std::result::Result<u16, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("{value:?} is not a valid port (1-65535)"))
+}
+
+/// DNS resolver that redirects connections for overridden hosts and falls back to the system
+/// resolver for everything else.
+///
+/// reqwest only passes the host name to resolvers, so rules are keyed by host. The port of a
+/// resolved address is honored when the URL uses its scheme's default port; for URLs with an
+/// explicit port the connection always uses that port, which `check_url` enforces up front.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolveOverrides {
+    rules: Arc<HashMap<String, ResolveRule>>,
+}
+
+impl ResolveOverrides {
+    pub(crate) fn from_args(raw: &[String]) -> Result<Self> {
+        let mut rules: HashMap<String, ResolveRule> = HashMap::new();
+        for raw in raw {
+            let rule = parse_resolve_rule(raw)?;
+            if let Some(existing) = rules.get(&rule.host) {
+                if existing != &rule {
+                    bail!(
+                        "conflicting --resolve rules for host {:?}: only one rule per host is supported",
+                        rule.host
+                    );
+                }
+                continue;
+            }
+            rules.insert(rule.host.clone(), rule);
+        }
+        Ok(Self {
+            rules: Arc::new(rules),
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Rejects URLs whose connection target cannot be expressed through DNS overriding.
+    pub(crate) fn check_url(&self, raw_url: &str) -> Result<()> {
+        let Ok(url) = Url::parse(raw_url) else {
+            return Ok(());
+        };
+        let Some(host) = url.host_str() else {
+            return Ok(());
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let Some(rule) = self.rules.get(&host.to_ascii_lowercase()) else {
+            return Ok(());
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return Ok(());
+        };
+        if port != rule.port {
+            bail!(
+                "--resolve rule for {}:{} does not match {raw_url} (port {port}); rules apply per host, so add a rule for port {port} instead",
+                rule.host,
+                rule.port
+            );
+        }
+        if url.port().is_some() && rule.target_port != port {
+            bail!(
+                "--resolve cannot change the port of {raw_url}, which names port {port} explicitly; use the scheme's default port in the URL or keep the target port at {port}"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Resolve for ResolveOverrides {
+    fn resolve(&self, name: Name) -> Resolving {
+        let rule = self.rules.get(&name.as_str().to_ascii_lowercase()).cloned();
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            let (host, port) = match &rule {
+                Some(rule) => (rule.target_host.clone(), rule.target_port),
+                None => (name, 0),
+            };
+            let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+                Ok(ip) => vec![SocketAddr::new(ip, port)],
+                Err(_) => tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .with_context(|| format!("failed to resolve {host}"))?
+                    .collect(),
+            };
+            if addrs.is_empty() {
+                return Err(anyhow!("no addresses found for {host}").into());
+            }
+            let addrs: Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(host: &str, port: u16, target_host: &str, target_port: u16) -> ResolveRule {
+        ResolveRule {
+            host: host.into(),
+            port,
+            target_host: target_host.into(),
+            target_port,
+        }
+    }
+
+    #[test]
+    fn parses_resolve_rules() {
+        for (raw, expected) in [
+            (
+                "www.google.com:443::127.0.0.1:1443",
+                rule("www.google.com", 443, "127.0.0.1", 1443),
+            ),
+            (
+                "WWW.Google.com:443::www.yahoo.com.sg:15423",
+                rule("www.google.com", 443, "www.yahoo.com.sg", 15423),
+            ),
+            (
+                "example.com:443::fe80::1:8443",
+                rule("example.com", 443, "fe80::1", 8443),
+            ),
+            (
+                "example.com:443::[fe80::1]:8443",
+                rule("example.com", 443, "fe80::1", 8443),
+            ),
+            (
+                "example.com:443::2001:db8::1:443",
+                rule("example.com", 443, "2001:db8::1", 443),
+            ),
+            (
+                "example.com:443::[10.0.0.1]:1443",
+                rule("example.com", 443, "10.0.0.1", 1443),
+            ),
+            (
+                "example.com:443::::1:1443",
+                rule("example.com", 443, "::1", 1443),
+            ),
+        ] {
+            assert_eq!(parse_resolve_rule(raw).unwrap(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_resolve_rules() {
+        for raw in [
+            "example.com",
+            "example.com:443",
+            "example.com:443:127.0.0.1:1443",
+            "example.com::127.0.0.1:1443",
+            "example.com:0::127.0.0.1:1443",
+            "example.com:443x::127.0.0.1:1443",
+            ":443::127.0.0.1:1443",
+            "example.com:443::",
+            "example.com:443::127.0.0.1",
+            "example.com:443::www.yahoo.com",
+            "example.com:443::127.0.0.1:x",
+            "example.com:443::127.0.0.1:",
+            "example.com:443::127.0.0.1:99999",
+            "example.com:443::127.0.0.1:443:extra",
+            "example.com:443::fe80::1",
+            "example.com:443::[fe80::1:443",
+            "example.com:443::[not-ipv6]:443",
+            "example.com:443:::1443",
+            "exa mple.com:443::127.0.0.1:1443",
+            "example.com:443::exa mple.com:1443",
+            "127.0.0.1:443::10.0.0.1:1443",
+            "example.com:443::[www.yahoo.com]:1443",
+        ] {
+            assert!(parse_resolve_rule(raw).is_err(), "{raw} should be rejected");
+        }
+    }
+
+    #[test]
+    fn checks_urls_against_rules() {
+        let overrides =
+            ResolveOverrides::from_args(&["example.com:443::127.0.0.1:1443".into()]).unwrap();
+        overrides.check_url("https://example.com/file").unwrap();
+        overrides.check_url("https://example.com:443/file").unwrap();
+        overrides.check_url("https://other.com:8443/file").unwrap();
+        assert!(overrides.check_url("http://example.com/file").is_err());
+
+        let same_port =
+            ResolveOverrides::from_args(&["example.com:8443::127.0.0.1:8443".into()]).unwrap();
+        same_port
+            .check_url("https://example.com:8443/file")
+            .unwrap();
+        let moved_port =
+            ResolveOverrides::from_args(&["example.com:8443::127.0.0.1:9443".into()]).unwrap();
+        assert!(
+            moved_port
+                .check_url("https://example.com:8443/file")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_rules_for_one_host() {
+        assert!(
+            ResolveOverrides::from_args(&[
+                "example.com:443::127.0.0.1:1443".into(),
+                "example.com:80::127.0.0.1:1080".into(),
+            ])
+            .is_err()
+        );
+    }
+}

@@ -56,13 +56,14 @@ pwget --self-update
 
 The updater verifies the asset's SHA-256 digest from GitHub release metadata and
 checks the downloaded binary's version before atomically replacing the current
-executable. Supported assets are macOS arm64/x86_64, FreeBSD x86_64, and Linux
-arm64/x86_64 (musl).
+executable. Supported assets are macOS arm64/x86_64, FreeBSD x86_64, Linux
+x86_64/arm64/armv7 (static musl), and Windows x86_64/arm64.
 
 Binary output (example toolchain path shown by Cargo):
 - `target/**/debug/pwget`
 
-Build release binaries for the supported macOS, FreeBSD, and Linux musl targets:
+Build release binaries for the supported macOS, FreeBSD, and Linux musl targets
+(Windows binaries are built by CI on Windows runners):
 
 ```bash
 ./build_all.sh
@@ -71,6 +72,17 @@ Build release binaries for the supported macOS, FreeBSD, and Linux musl targets:
 The script writes successful outputs to `dist/` and reports targets that need a
 cross-linker or platform sysroot. Pushing a `v*` tag builds the target binaries
 on native/cross-compile runners and attaches them to a GitHub release.
+
+### Container image
+
+Each release also publishes a multi-arch image (`linux/amd64`, `linux/arm64`,
+`linux/arm/v7`) to `ghcr.io/wushilin/pwget`, and to Docker Hub as
+`<DOCKERHUB_USERNAME>/pwget` when the repository has `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` secrets. The working directory is `/data`:
+
+```bash
+docker run --rm -v "$PWD:/data" ghcr.io/wushilin/pwget https://example.com/big.iso --noui
+```
 
 ---
 
@@ -128,6 +140,30 @@ pwget https://example.com/file.bin --header "X-LXC-No-GeoIP:on"
 
 `Range` and `Accept-Encoding` are managed by `pwget` and cannot be overridden. Downloads force
 `Accept-Encoding: identity` so byte ranges, resume metadata, and output bytes stay consistent.
+
+Override where connections go, like curl's `--resolve` (repeatable). The format is
+`HOST:PORT::TARGET:TARGET_PORT`, and both ports are required. `HOST` must be a host name;
+`TARGET` may be a host name, an IPv4 address, or an IPv6 address (brackets are optional around
+IP addresses and not allowed around host names, e.g.
+`www.google.com:443::2001:db8::1:8443` or `www.google.com:443::[2001:db8::1]:8443`). The first
+`::` ends `HOST:PORT` and the last `:` starts `TARGET_PORT`. Malformed rules are rejected with the
+reason:
+
+```bash
+pwget https://www.google.com/file.bin --resolve www.google.com:443::127.0.0.1:1443
+pwget https://www.google.com/file.bin --resolve www.google.com:443::www.yahoo.com.sg:15423
+```
+
+TLS SNI, certificate verification, and the `Host` header still use the original host. Rules are
+matched by host name, so one host can have only one rule. A URL that names a non-default port
+explicitly (`https://host:8443/`) can be redirected to another address but must keep that port.
+
+Skip TLS certificate and hostname verification (insecure, e.g. for self-signed servers or a
+`--resolve` target with a different certificate):
+
+```bash
+pwget -k https://self-signed.example.com/file.bin
+```
 
 Worker controls:
 - `-n`: initial enabled workers (default `5`)

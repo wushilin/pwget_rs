@@ -9,6 +9,7 @@ targets=(
   x86_64-unknown-freebsd
   x86_64-unknown-linux-musl
   aarch64-unknown-linux-musl
+  armv7-unknown-linux-musleabihf
 )
 
 command -v cargo >/dev/null || { echo "cargo is required" >&2; exit 1; }
@@ -22,7 +23,7 @@ failed=()
 
 for target in "${targets[@]}"; do
   echo "==> Building pwget for ${target}"
-  if [[ "$target" == *-unknown-linux-musl || "$target" == *-unknown-freebsd ]] && command -v cross >/dev/null; then
+  if [[ "$target" == *-unknown-linux-musl* || "$target" == *-unknown-freebsd ]] && command -v cross >/dev/null; then
     build_status=0
     cross build --locked --release --target "$target" || build_status=$?
   else

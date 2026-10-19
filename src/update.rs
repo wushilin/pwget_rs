@@ -63,7 +63,7 @@ pub(crate) async fn self_update() -> Result<()> {
         .await
         .context("failed to parse GitHub release metadata")?;
 
-    let asset_name = format!("pwget-{target}");
+    let asset_name = format!("pwget-{target}{}", std::env::consts::EXE_SUFFIX);
     let asset = release
         .assets
         .iter()
@@ -103,8 +103,11 @@ pub(crate) async fn self_update() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_nanos();
-    let temp_path =
-        executable.with_file_name(format!(".pwget-update-{}-{nonce}.tmp", std::process::id()));
+    let temp_path = executable.with_file_name(format!(
+        ".pwget-update-{}-{nonce}.tmp{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
     let mut temp_file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -188,6 +191,19 @@ pub(crate) async fn self_update() -> Result<()> {
         version_line.trim()
     );
 
+    // Windows cannot overwrite a running executable, but it can rename it out of the way.
+    #[cfg(windows)]
+    {
+        let old = executable.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&executable, &old).with_context(|| {
+            format!(
+                "failed to move aside running executable {}",
+                executable.display()
+            )
+        })?;
+    }
+
     tokio::fs::rename(&temp_path, &executable)
         .await
         .with_context(|| format!("failed to replace executable {}", executable.display()))?;
@@ -202,6 +218,9 @@ fn release_target(os: &str, arch: &str) -> Result<&'static str> {
         ("freebsd", "x86_64") => Ok("x86_64-unknown-freebsd"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "arm") => Ok("armv7-unknown-linux-musleabihf"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         _ => bail!("self-update is not available for {os}/{arch}"),
     }
 }
@@ -242,7 +261,11 @@ mod tests {
             release_target("linux", "x86_64").unwrap(),
             "x86_64-unknown-linux-musl"
         );
-        assert!(release_target("windows", "x86_64").is_err());
+        assert_eq!(
+            release_target("windows", "x86_64").unwrap(),
+            "x86_64-pc-windows-msvc"
+        );
+        assert!(release_target("windows", "x86").is_err());
     }
 
     #[test]
